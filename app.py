@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram Planner v2.01 — the whole program, in one file.
+Telegram Planner v2.02 — the whole program, in one file.
 
 A Telegram bot that keeps a personal schedule in SQLite. You message it in plain
 English; it figures out what you mean, shows you what it's about to save, and
@@ -10,10 +10,29 @@ writes only after you say "yes".
   python app.py --selftest   prove storage works, no API key needed
   python app.py --ask "..."  print what the LLM returns, no Telegram needed
   python app.py --init       create planner.db and exit
+  python app.py --version    print the version and the timezone it sees
 
 --------------------------------------------------------------------------------
 CHANGELOG (newest first)
 --------------------------------------------------------------------------------
+v2.02.0  2026-09-29  Recurring meetings, history, a clock, and a phone-sized help.
+                    - REPEATING entries: daily / weekdays / weekly / monthly.
+                      An end date is MANDATORY. Give either "until 30 nov" or
+                      "8 times"; if neither is present the bot asks for one and
+                      creates nothing until it has an answer. The confirmation
+                      card always states the number of occurrences AND the final
+                      date before you say "yes". Each occurrence is stored as its
+                      own row, so any single date can be edited or deleted alone.
+                    - HISTORY: "history" lists what is finished (✔) or whose day
+                      has already passed (○), newest first. Understands "history
+                      this month" and "what did I do last week".
+                    - CLOCK: "now" / "date" / "time" reports the current date,
+                      time, timezone and UTC offset — and warns loudly if the
+                      machine is not on Singapore time.
+                    - HELP rewritten for a phone: short lines, one column, no
+                      ragged wrapping.
+                    - --version flag, VERSION constant, tag v2.02.0 on GitHub.
+
 v2.01.1  2026-09-28  Fixes from real `--ask` output on the user's machine.
                     - "today" and "tomorrow" returned two different intents
                       ("today" vs "list"), so the same job had two code paths.
@@ -44,6 +63,7 @@ from __future__ import annotations
 # 1. CONFIG
 # =============================================================================
 
+import calendar
 import json
 import os
 import re
@@ -72,9 +92,17 @@ except ImportError:
 
 load_dotenv()
 
+VERSION = "2.02.0"
+
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 MODEL = os.getenv("MODEL", "gpt-5-nano").strip()
+
+# The timezone we claim to be in. The server's actual clock is checked against
+# this at startup and by "now" — a UTC server silently shifts everything 8 hours,
+# which is the single nastiest failure mode this bot can have.
+TZ_NAME = os.getenv("TZ_NAME", "Asia/Singapore").strip() or "Asia/Singapore"
+TZ_EXPECTED_OFFSET = "+08:00"
 
 try:
     ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", "0").strip())
@@ -91,6 +119,14 @@ TG_FILE = f"https://api.telegram.org/file/bot{TOKEN}"
 
 # How many times you may revise a draft before it's dropped.
 MAX_CONFIRM_TURNS = 5
+
+# The most rows one repeating entry may create. A backstop against a typo like
+# "every day until 2099".
+MAX_OCCURRENCES = 120
+
+# History defaults: the last week, at most this many lines on screen.
+HISTORY_DAYS = 7
+HISTORY_SHOWN = 25
 
 # "yes" / "no" word sets for the confirmation gate.
 YES_WORDS = {
@@ -288,6 +324,30 @@ def search_entries(term: str, limit: int = 15):
         conn.close()
 
 
+def history_entries(start: str, end: str, limit: int = 200):
+    """What happened in a window: finished items, plus anything still open whose
+    day has already gone by. Newest first, because that's how you read a log.
+
+    Finished items are also returned when their date sits *after* the window, so
+    a task you complete early never becomes invisible: the day-based part of the
+    window doesn't apply to something you have already ticked off.
+    """
+    conn = connect()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM entries"
+            " WHERE (event_date >= :start AND event_date <= :end"
+            "        AND (status = 'done' OR event_date < :today))"
+            "    OR (status = 'done' AND event_date > :end)"
+            " ORDER BY event_date DESC, (event_time IS NULL), event_time DESC, id DESC"
+            " LIMIT :limit",
+            {"start": start, "end": end, "today": today_iso(), "limit": limit},
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
 def count_entries() -> int:
     conn = connect()
     try:
@@ -311,6 +371,13 @@ Possible replies:
   Add something new:
     {{"intent": "add", "title": "...", "event_date": "YYYY-MM-DD", "event_time": "HH:MM"}}
 
+  Add something that REPEATS. "freq" is one of: daily, weekdays, weekly, monthly.
+  A repeating item must also carry "until" (an end date) or "count" (how many times):
+    {{"intent": "add", "title": "Standup", "event_date": "YYYY-MM-DD", "event_time": "09:00",
+      "freq": "weekdays", "until": "YYYY-MM-DD"}}
+    {{"intent": "add", "title": "Rent", "event_date": "YYYY-MM-DD", "freq": "monthly",
+      "count": 12}}
+
   What is on today / tomorrow / a named day:
     {{"intent": "list", "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD"}}
 
@@ -319,6 +386,13 @@ Possible replies:
 
   Everything still open, with no date limit:
     {{"intent": "list_all"}}
+
+  What is already finished, or whose day has passed (dates optional):
+    {{"intent": "history", "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD"}}
+    {{"intent": "history"}}
+
+  The current date, time or timezone:
+    {{"intent": "now"}}
 
   Change an existing entry (only include fields that change):
     {{"intent": "edit", "id": 12, "title": "...", "event_date": "YYYY-MM-DD", "event_time": "HH:MM"}}
@@ -351,6 +425,20 @@ Rules:
 - "all events", "everything", "show me all", "my whole schedule" and "what have
   I got" mean the entire open list with no date limit — use "list_all". Only use
   "list" when a specific day or bounded range is asked for.
+- Repeating language ("every monday", "every day", "daily standup", "every
+  weekday", "Monday to Friday", "monthly", "each month") means set "freq".
+  Use "weekdays" for "every weekday" / "every working day" / "Monday to Friday",
+  and "weekly" for "every monday" (the weekday comes from event_date).
+  "freq" implies event_date is the FIRST occurrence.
+- A repeating "add" must include "until" or "count" if the user stated one:
+  "until 30 nov", "till end of the year", "for 8 weeks" (8 weeks of a weekly item
+  is count 8), "12 times", "10 sessions". If the user gave no end at all, omit
+  BOTH "until" and "count" — never invent an end date, the app will ask for it.
+- "history", "what did I do", "what's finished", "completed", "past items" mean
+  the "history" intent. Add start_date and end_date only when the user names a
+  period ("history this month", "last week").
+- "what time is it", "what's the date", "what day is it", "today's date" mean
+  the "now" intent. Do not answer the question yourself — you cannot read a clock.
 - If no clock time is stated, set "event_time" to null. A bare "morning",
   "afternoon" or "evening" is NOT a clock time — use null. Only a real time
   ("1pm", "13:00", "7.30pm", "1900") counts.
@@ -492,6 +580,247 @@ def relative_day(iso: str) -> str:
     return {0: "today", 1: "tomorrow", -1: "yesterday"}.get(delta, "")
 
 
+def short_date(iso: str) -> str:
+    """'2026-09-29' -> '29 Sep'. For headers that must stay phone-sized."""
+    try:
+        return datetime.strptime(iso, "%Y-%m-%d").strftime("%d %b")
+    except ValueError:
+        return iso
+
+
+def offset_str(moment: datetime | None = None) -> str:
+    """The machine's real UTC offset, e.g. '+08:00'.
+
+    Read from the OS, not from config, so a mis-set server clock is visible
+    rather than hidden.
+    """
+    off = (moment or datetime.now()).astimezone().utcoffset() or timedelta(0)
+    total = int(off.total_seconds())
+    sign = "+" if total >= 0 else "-"
+    total = abs(total)
+    return f"{sign}{total // 3600:02d}:{(total % 3600) // 60:02d}"
+
+
+def tz_is_suspect() -> bool:
+    """True when the clock is NOT on the timezone we think we're in."""
+    return offset_str() != TZ_EXPECTED_OFFSET
+
+
+# --- recurring series --------------------------------------------------------
+
+FREQ_LABEL = {
+    "daily": "every day",
+    "weekdays": "every weekday (Mon–Fri)",
+    "weekly": "weekly",
+    "monthly": "monthly",
+}
+
+_FREQ_ALIASES = {
+    "daily": "daily", "day": "daily", "days": "daily", "every day": "daily",
+    "everyday": "daily", "each day": "daily",
+    "weekdays": "weekdays", "weekday": "weekdays", "working days": "weekdays",
+    "every weekday": "weekdays", "every working day": "weekdays",
+    "weekly": "weekly", "week": "weekly", "weeks": "weekly", "every week": "weekly",
+    "monthly": "monthly", "month": "monthly", "months": "monthly",
+    "every month": "monthly", "each month": "monthly",
+}
+
+
+def validate_freq(value) -> str | None:
+    """Map whatever the model said onto one of our four frequencies."""
+    if not isinstance(value, str):
+        return None
+    return _FREQ_ALIASES.get(value.strip().lower())
+
+
+def add_months(d: date, months: int) -> date:
+    """Month arithmetic that cannot overflow: 31 Jan +1 month -> 28 Feb.
+
+    Always computed from the original date, so a monthly series on the 31st
+    returns to the 31st in months long enough to have one.
+    """
+    year = d.year + (d.month - 1 + months) // 12
+    month = (d.month - 1 + months) % 12 + 1
+    last_day = calendar.monthrange(year, month)[1]
+    return date(year, month, min(d.day, last_day))
+
+
+def build_series(start_iso: str, freq: str, until_iso: str | None, count: int | None):
+    """Every date in a repeating series. Returns (dates, error).
+
+    An end date is MANDATORY: callers must supply `until_iso` or `count`.
+    `count` counts occurrences — in "weekdays" mode that means weekdays only,
+    so "10 times" lands on a Friday, not a fortnight later.
+    """
+    try:
+        start = datetime.strptime(start_iso or "", "%Y-%m-%d").date()
+    except ValueError:
+        return None, "I couldn't work out the first date of that series."
+
+    if freq not in FREQ_LABEL:
+        return None, "I can only repeat daily, on weekdays, weekly or monthly."
+
+    until = None
+    if until_iso:
+        try:
+            until = datetime.strptime(until_iso, "%Y-%m-%d").date()
+        except ValueError:
+            return None, "That end date isn't a real date."
+        if until < start:
+            return None, (
+                f"The end date ({pretty_date(until_iso)}) is before the first one "
+                f"({pretty_date(start_iso)}). Give me a later end date."
+            )
+
+    limit = count if isinstance(count, int) and count > 0 else None
+    if limit is None and until is None:
+        return None, "A repeating entry needs an end date, or a number of times."
+
+    dates: list[str] = []
+    step = 0
+    while True:
+        if freq == "monthly":
+            d = add_months(start, step)
+        elif freq == "weekly":
+            d = start + timedelta(weeks=step)
+        else:                                   # daily / weekdays
+            d = start + timedelta(days=step)
+        step += 1
+
+        if freq == "weekdays" and d.weekday() >= 5:
+            continue                            # Sat/Sun are skipped, not counted
+        if until and d > until:
+            break
+        dates.append(d.isoformat())
+        if limit and len(dates) >= limit:
+            break
+        if len(dates) > MAX_OCCURRENCES:
+            return None, (
+                f"That would create more than {MAX_OCCURRENCES} entries. "
+                "Give me a nearer end date."
+            )
+    if not dates:
+        return None, "That series has no dates in it — check the end date."
+    return dates, None
+
+
+def plan_dates(payload: dict):
+    """Which dates will this draft create? Returns (dates, problem_message).
+
+    Exactly one of the two is None. "problem_message" is what to say when the
+    user still owes us an end date — the draft stays open and nothing is written.
+    """
+    start = payload.get("event_date")
+    freq = payload.get("freq")
+    if not freq:
+        return [start], None
+
+    until = validate_date(payload.get("until"))
+    count = payload.get("count")
+    count = count if isinstance(count, int) and count > 0 else None
+
+    if not until and not count:
+        return None, (
+            "🔁 How long should this repeat?\n"
+            "─────────────\n"
+            "An end date is required.\n"
+            "\n"
+            "   • end date  →  \"until 30 nov\"\n"
+            "   • or a count  →  \"8 times\"\n"
+            "\n"
+            "Nothing is saved until you answer."
+        )
+    return build_series(start, freq, until, count)
+
+
+_MONTHS = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9, "oct": 10,
+    "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+}
+
+
+def _resolve(day: int, month: int, year: int | None, start_iso: str) -> str | None:
+    """Build a date, assuming the next occurrence when the year is omitted."""
+    try:
+        start = datetime.strptime(start_iso or today_iso(), "%Y-%m-%d").date()
+    except ValueError:
+        start = date.today()
+    try:
+        d = date(year or start.year, month, day)
+    except ValueError:
+        return None                       # e.g. 31 Feb
+    if year is None and d < start:
+        try:
+            d = d.replace(year=d.year + 1)
+        except ValueError:
+            return None                       # 29 Feb in a non-leap year
+    return d.isoformat()
+
+
+def parse_end_answer(text: str, freq: str | None, start_iso: str):
+    """Read a reply to "how long should this repeat?" without calling the model.
+
+    Returns ("until", "YYYY-MM-DD") or ("count", 8) — or (None, None) when it
+    isn't sure, in which case the caller falls through to the LLM. Deterministic
+    date arithmetic only, so a plain "30 nov" is answered instantly and free.
+    """
+    low = " ".join(text.strip().lower().replace(",", " ").split())
+    low = re.sub(r"^(until|till|til|through|to|by|ending|ends|end|for)\s+", "", low)
+    if not low:
+        return None, None
+
+    # "8 times" / "8 sessions" / "x8" / bare "8"
+    m = re.fullmatch(
+        r"(?:x\s*)?(\d{1,3})\s*"
+        r"(?:times|time|sessions|session|occurrences|occurrence|entries|entry)?",
+        low,
+    )
+    if m:
+        n = int(m.group(1))
+        return ("count", n) if 0 < n <= MAX_OCCURRENCES else (None, None)
+
+    # "8 weeks" is a count when the series is weekly
+    m = re.fullmatch(r"(\d{1,3})\s*(?:weeks|week)", low)
+    if m and freq == "weekly":
+        n = int(m.group(1))
+        return ("count", n) if 0 < n <= MAX_OCCURRENCES else (None, None)
+
+    # "2026-11-30"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", low):
+        return ("until", validate_date(low)) if validate_date(low) else (None, None)
+
+    # "30 nov" / "30 nov 2026" / "30 november"
+    m = re.fullmatch(r"(\d{1,2})\s+([a-z]{3,9})(?:\s+(\d{4}))?", low)
+    if m:
+        month = _MONTHS.get(m.group(2))
+        if month:
+            iso = _resolve(int(m.group(1)), month,
+                           int(m.group(3)) if m.group(3) else None, start_iso)
+            return ("until", iso) if iso else (None, None)
+
+    # "nov 30" / "november 30 2026"
+    m = re.fullmatch(r"([a-z]{3,9})\s+(\d{1,2})(?:\s+(\d{4}))?", low)
+    if m:
+        month = _MONTHS.get(m.group(1))
+        if month:
+            iso = _resolve(int(m.group(2)), month,
+                           int(m.group(3)) if m.group(3) else None, start_iso)
+            return ("until", iso) if iso else (None, None)
+
+    # "30/11" or "30/11/2026"
+    m = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?", low)
+    if m:
+        year = m.group(3)
+        if year:
+            year = int(year) + (2000 if len(year) == 2 else 0)
+        iso = _resolve(int(m.group(1)), int(m.group(2)), year, start_iso)
+        return ("until", iso) if iso else (None, None)
+
+    return None, None
+
+
 # --- rendering ---------------------------------------------------------------
 
 def render_line(e: dict) -> str:
@@ -509,35 +838,81 @@ def render_agenda(d: str, items: list, heading: str | None = None) -> str:
 
 
 def render_full_entry(e: dict) -> str:
+    mark = "✔ done" if e.get("status") == "done" else "○ open"
     bits = [
         f"📅 {pretty_date(e['event_date'])}"
         + (f" — {pretty_time(e['event_time'])}" if e.get("event_time") else " — all day"),
         f"📝 {e['title']}",
-        f"🆔 #{e['id']}  ({e['status']})",
+        f"🆔 #{e['id']}  ({mark})",
     ]
+    # The original wording is part of the record: it's how you remember what you
+    # actually meant. Only shown when it adds something.
+    raw = (e.get("raw_input") or "").strip()
+    if raw and raw.lower() != (e.get("title") or "").strip().lower():
+        bits.append(f"💬 You said: {raw}")
     return "\n".join(bits)
 
 
 def help_text() -> str:
+    """Kept deliberately narrow: one column, short lines, no ragged wrapping.
+
+    Every example sits under ~35 characters so it survives a phone screen
+    without folding in half.
+    """
     return (
-        "📔 Planner — what I do\n"
+        "📔 Planner — quick guide\n"
         "\n"
-        "Add      \"lunch with sarah tomorrow 1pm\"\n"
-        "         \"submit gst 30 oct\"\n"
-        "         \"call mum friday 7pm\"\n"
-        "Today    \"today\"\n"
-        "Other    \"tomorrow\" · \"friday\" · \"this week\" · \"all events\"\n"
-        "         \"overdue\"\n"
-        "Search   \"search dentist\"\n"
-        "Change   \"edit 12 to 2pm\"\n"
-        "         \"delete 12\"\n"
-        "         \"done 12\"\n"
-        "Help     \"help\"\n"
+        "➕ ADD\n"
+        "   lunch with sarah tomorrow 1pm\n"
+        "   submit gst 30 oct\n"
         "\n"
-        "I'll always show you what I'm about to save, and wait for \"yes\".\n"
-        "If you name a real clock time, I'll keep it. \"Morning\", \"afternoon\"\n"
-        "and \"evening\" are treated as all-day — say \"9am\" if you mean 9am."
+        "🔁 REPEAT\n"
+        "   standup 9am weekdays until 30 nov\n"
+        "   rent 1 oct monthly 12 times\n"
+        "\n"
+        "🔍 FIND\n"
+        "   today · tomorrow · friday\n"
+        "   this week · all events\n"
+        "   overdue · search dentist\n"
+        "\n"
+        "✏️ CHANGE\n"
+        "   edit 12 to 2pm\n"
+        "   delete 12 · done 12\n"
+        "\n"
+        "🕐 INFO\n"
+        "   now · history · help\n"
+        "\n"
+        "Every save is shown first, then\n"
+        "it waits for your \"yes\".\n"
+        "A repeating item needs an end\n"
+        "date or a number of times.\n"
+        "\n"
+        "\"Morning\" means all day —\n"
+        "say \"9am\" if you mean 9am."
     )
+
+
+def render_now() -> str:
+    """The clock, honestly reported: date, time, timezone and real UTC offset."""
+    now = datetime.now()
+    offset = offset_str(now)
+    lines = [
+        "🕐 Right now",
+        "─────────────",
+        f"📅 {now.strftime('%A, %d %b %Y')}",
+        f"🕒 {now.strftime('%I:%M %p').lstrip('0')}",
+        f"🌏 {TZ_NAME}  (UTC{offset})",
+        f"🔢 {now.strftime('%Y-%m-%d')}",
+    ]
+    if offset != TZ_EXPECTED_OFFSET:
+        lines += [
+            "",
+            "⚠️ This machine is NOT on Singapore time.",
+            f"   Expected UTC{TZ_EXPECTED_OFFSET}, got UTC{offset}.",
+            "   Fix with:",
+            "   sudo timedatectl set-timezone Asia/Singapore",
+        ]
+    return "\n".join(lines)
 
 
 # --- Telegram transport ------------------------------------------------------
@@ -572,29 +947,78 @@ def notify_owner(text: str) -> None:
 # --- the confirmation gate ---------------------------------------------------
 
 def build_preview(payload: dict) -> str:
-    d, t, title = payload["event_date"], payload["event_time"], payload["title"]
+    """The card the user approves. Nothing is written until they answer it.
+
+    For a repeating draft this MUST state both the number of occurrences and the
+    final date — that is the whole point of making an end date compulsory.
+    """
+    title = payload["title"]
+    t = payload.get("event_time")
+    dates = payload.get("dates") or [payload["event_date"]]
+    freq = payload.get("freq")
+    repeats = bool(freq) and len(dates) > 1
+
     lines = [
-        "Add this?",
+        "🔁 Save this series?" if repeats else "Add this?",
         "─────────────",
-        f"📅 {pretty_date(d)}"
-        + (f" — {pretty_time(t)}" if t else "  (all day)"),
         f"📝 {title}",
+        f"📅 {pretty_date(dates[0])}"
+        + (f" — {pretty_time(t)}" if t else "  (all day)"),
     ]
-    # Cheap conflict check: same day, both timed, same clock time.
+
+    if repeats:
+        lines += [
+            f"🔁 Repeats {FREQ_LABEL.get(freq, freq)}",
+            f"🔢 {len(dates)} occurrences",
+            f"🏁 Ends {pretty_date(dates[-1])}",
+        ]
+
+    # Conflict check: same clock time, overlapping days, a different title.
     if t:
         clashes = [
-            e for e in entries_for_date(d)
+            e for e in entries_in_range(dates[0], dates[-1])
             if e.get("event_time") == t and e["title"].lower() != title.lower()
         ]
         if clashes:
-            lines.append(f"⚠️ Clashes with: {clashes[0]['title']} (#{clashes[0]['id']})")
+            extra = f"  (+{len(clashes) - 1} more)" if len(clashes) > 1 else ""
+            lines.append(
+                f"⚠️ Clashes with {clashes[0]['title']} (#{clashes[0]['id']}){extra}"
+            )
+
     lines.append("─────────────")
-    lines.append('Reply "yes" to save, "no" to cancel, or tell me what to change.')
+    if repeats:
+        lines.append(f"Reply \"yes\" to save all {len(dates)},")
+        lines.append("\"no\" to cancel, or tell me")
+        lines.append("what to change.")
+    else:
+        lines.append('Reply "yes" to save, "no" to')
+        lines.append('cancel, or tell me what to change.')
     return "\n".join(lines)
 
 
+def present_draft(chat_id: int, user_id: int, payload: dict, turns: int = 0) -> None:
+    """Show the draft card — or ask for the missing end date. Writes nothing.
+
+    Every path that creates an entry funnels through here, so a repeating draft
+    can never reach the database without a stated end date.
+    """
+    dates, problem = plan_dates(payload)
+    payload.pop("dates", None)
+    PENDING[user_id] = {
+        "action": "add",
+        "data": payload,
+        "turns": turns,
+        "orig": payload.get("raw_input", ""),
+    }
+    if problem:
+        send(chat_id, problem)
+        return
+    payload["dates"] = dates
+    send(chat_id, build_preview(payload))
+
+
 def ask_add(chat_id: int, user_id: int, user_text: str, data: dict) -> None:
-    """Draft a new entry and ask for confirmation. Nothing is written yet."""
+    """Draft a new entry (possibly repeating) and ask for confirmation."""
     d = validate_date(data.get("event_date"))
     if not d:
         send(chat_id, "I couldn't work out the date. Try \"tomorrow 1pm\" or \"30 oct\".")
@@ -602,7 +1026,25 @@ def ask_add(chat_id: int, user_id: int, user_text: str, data: dict) -> None:
 
     t = validate_time(data.get("event_time"))
 
-    if d < today_iso():
+    title = (data.get("title") or "").strip()
+    if not title:
+        send(chat_id, "I need a short title for that. What should I call it?")
+        return
+
+    # Recurrence. An unrecognised frequency is never silently ignored — dropping
+    # it would quietly turn "every 2 weeks" into a single entry.
+    freq = None
+    if data.get("freq"):
+        freq = validate_freq(data.get("freq"))
+        if not freq:
+            send(
+                chat_id,
+                "🔁 I can repeat daily, on weekdays, weekly or monthly.\n"
+                "Which did you mean?",
+            )
+            return
+
+    if d < today_iso() and not freq:
         send(
             chat_id,
             f"⚠️ That date is in the past ({pretty_date(d)}).\n"
@@ -611,14 +1053,19 @@ def ask_add(chat_id: int, user_id: int, user_text: str, data: dict) -> None:
         )
         return
 
-    title = (data.get("title") or "").strip()
-    if not title:
-        send(chat_id, "I need a short title for that. What should I call it?")
-        return
-
-    payload = {"event_date": d, "event_time": t, "title": title, "raw_input": user_text}
-    PENDING[user_id] = {"action": "add", "data": payload, "turns": 0, "orig": user_text}
-    send(chat_id, build_preview(payload))
+    count = data.get("count")
+    payload = {
+        "event_date": d,
+        "event_time": t,
+        "title": title,
+        "raw_input": user_text,
+        "freq": freq,
+        "until": validate_date(data.get("until")),
+        "count": count if isinstance(count, int) and count > 0 else None,
+    }
+    if payload["until"]:
+        payload["count"] = None          # an end date is the clearer instruction
+    present_draft(chat_id, user_id, payload)
 
 
 def confirm(chat_id: int, user_id: int) -> None:
@@ -628,18 +1075,38 @@ def confirm(chat_id: int, user_id: int) -> None:
         send(chat_id, "Nothing to confirm. What would you like to add?")
         return
     data = pending["data"]
+    dates = data.get("dates") or [data["event_date"]]
+    # Belt and braces: a repeating draft must carry its expanded dates, and those
+    # dates only exist once an end date or a count was supplied.
+    if data.get("freq") and not data.get("dates"):
+        _, problem = plan_dates(data)
+        PENDING[user_id] = pending          # keep the draft alive
+        send(chat_id, problem or "How long should this repeat?")
+        return
     try:
-        new_id = insert_entry(
-            data["event_date"], data["event_time"], data["title"], data["raw_input"]
-        )
+        ids = [
+            insert_entry(d, data["event_time"], data["title"], data["raw_input"])
+            for d in dates
+        ]
     except Exception as exc:  # noqa: BLE001
         print(f"[db] insert failed: {exc}", flush=True)
         send(chat_id, f"Sorry — I couldn't save that ({type(exc).__name__}). Try again.")
         return
-    when = pretty_date(data["event_date"])
-    if data["event_time"]:
-        when += f", {pretty_time(data['event_time'])}"
-    send(chat_id, f"✅ Saved #{new_id} — {when}\n{data['title']}")
+
+    if len(ids) == 1:
+        when = pretty_date(dates[0])
+        if data.get("event_time"):
+            when += f", {pretty_time(data['event_time'])}"
+        send(chat_id, f"✅ Saved #{ids[0]} — {when}\n{data['title']}")
+        return
+
+    send(
+        chat_id,
+        f"✅ Saved {len(ids)} entries  (#{ids[0]}–#{ids[-1]})\n"
+        f"🔁 Repeats {FREQ_LABEL.get(data.get('freq'), 'yes')}\n"
+        f"🏁 Ends {pretty_date(dates[-1])}\n"
+        f"📝 {data['title']}",
+    )
 
 
 def revise(chat_id: int, user_id: int, pending: dict, change_text: str) -> None:
@@ -651,26 +1118,59 @@ def revise(chat_id: int, user_id: int, pending: dict, change_text: str) -> None:
         return
 
     data = pending["data"]
+    repeat_note = ""
+    if data.get("freq"):
+        repeat_note = (
+            "\nIt repeats " + FREQ_LABEL.get(data["freq"], data["freq"])
+            + " from " + data["event_date"]
+            + (f" until {data['until']}" if data.get("until") else "")
+            + (f", {data['count']} times" if data.get("count") else "")
+            + ("" if (data.get("until") or data.get("count")) else ", END DATE MISSING")
+        )
     combined = (
         f"Original: {pending['orig']}\n"
         f"Currently drafted: {data['title']} on {data['event_date']} "
-        f"at {data['event_time'] or 'no time'}\n"
+        f"at {data['event_time'] or 'no time'}{repeat_note}\n"
         f"Change requested: {change_text}\n"
-        "Apply the change and return the full updated 'add' object."
+        "Apply the change and return the full updated 'add' object. Keep 'freq', "
+        "'until' and 'count' if it still repeats; remove them if it should not "
+        "repeat any more."
     )
     result = call_llm(combined)
 
     if result.get("intent") != "add":
-        # We couldn't parse the change as an edit — just say so and keep waiting.
+        # Still waiting on an end date? Ask for it again rather than showing a
+        # half-formed card.
+        if data.get("freq") and not (data.get("until") or data.get("count")):
+            _, problem = plan_dates(data)
+            if problem:
+                send(chat_id, "Sorry, I didn't catch that.\n\n" + problem)
+                return
         send(chat_id, f"Sorry, I didn't catch that. {build_preview(data)}")
         return
 
     new_date = validate_date(result.get("event_date")) or data["event_date"]
-    new_time = validate_time(result.get("event_time"))
-    new_title = (result.get("title") or data["title"]).strip()
+    new_freq = validate_freq(result.get("freq")) if result.get("freq") else None
 
-    data.update({"event_date": new_date, "event_time": new_time, "title": new_title})
-    send(chat_id, build_preview(data))
+    # An end date/count survives an unrelated edit, but is dropped if the item
+    # stops repeating.
+    raw_count = result.get("count")
+    new_until = validate_date(result.get("until")) or (data.get("until") if new_freq else None)
+    new_count = raw_count if isinstance(raw_count, int) and raw_count > 0 else (
+        data.get("count") if new_freq else None
+    )
+    if new_until:
+        new_count = None
+
+    data.update({
+        "event_date": new_date,
+        "event_time": validate_time(result.get("event_time")),
+        "title": (result.get("title") or data["title"]).strip(),
+        "freq": new_freq,
+        "until": new_until,
+        "count": new_count,
+    })
+    present_draft(chat_id, user_id, data, turns=pending["turns"])
 
 
 def handle_pending(chat_id: int, user_id: int, text: str) -> None:
@@ -679,6 +1179,30 @@ def handle_pending(chat_id: int, user_id: int, text: str) -> None:
     if not pending:
         return
     low = text.strip().lower().rstrip("!.")
+    data = pending.get("data") or {}
+    awaiting_end = bool(data.get("freq")) and not (data.get("until") or data.get("count"))
+
+    # A repeat still owes us an end date, so "yes" is not yet answerable.
+    if awaiting_end:
+        if low in NO_WORDS:
+            PENDING.pop(user_id, None)
+            send(chat_id, "Cancelled — nothing was saved.")
+            return
+        kind, value = parse_end_answer(text, data.get("freq"), data.get("event_date"))
+        if kind == "until":
+            data["until"], data["count"] = value, None
+            present_draft(chat_id, user_id, data, turns=pending.get("turns", 0))
+            return
+        if kind == "count":
+            data["count"], data["until"] = value, None
+            present_draft(chat_id, user_id, data, turns=pending.get("turns", 0))
+            return
+        if low in YES_WORDS:
+            _, problem = plan_dates(data)
+            send(chat_id, problem or "How long should this repeat?")
+            return
+        revise(chat_id, user_id, pending, text)
+        return
 
     if low in YES_WORDS:
         confirm(chat_id, user_id)
@@ -748,6 +1272,46 @@ def show_overdue(chat_id: int) -> None:
             blocks.append(f"\n── {pretty_date(current)}")
         blocks.append(render_line(e))
     send(chat_id, f"⏰ {len(items)} open item(s) from before today\n" + "\n".join(blocks))
+
+
+def show_history(chat_id: int, start: str | None = None, end: str | None = None) -> None:
+    """What already happened: finished items and days gone by, newest first.
+
+    ✔ = marked done, ○ = still open but its day has passed.
+    """
+    end = end or today_iso()
+    start = start or (date.today() - timedelta(days=HISTORY_DAYS - 1)).isoformat()
+    if start > end:
+        start, end = end, start
+
+    items = history_entries(start, end)
+    span = f"{short_date(start)} → {short_date(end)}"
+    if not items:
+        send(chat_id, f"🕘 No history between {span}.\nNothing finished or past.")
+        return
+
+    shown = items[:HISTORY_SHOWN]
+    blocks, current = [], None
+    for e in shown:
+        if e["event_date"] != current:
+            current = e["event_date"]
+            rel = relative_day(current)
+            label = f"{pretty_date(current)}  ({rel})" if rel else pretty_date(current)
+            blocks.append(f"\n── {label}")
+        mark = "✔" if e["status"] == "done" else "○"
+        t = pretty_time(e.get("event_time"))
+        tag = f"{t:>7}" if e.get("event_time") else "  all day"
+        blocks.append(f"  {mark} {tag}  {e['title']}   (#{e['id']})")
+
+    done = sum(1 for e in items if e["status"] == "done")
+    head = f"🕘 History — {len(items)} item(s)\n{span}  ·  {done} done"
+    if len(items) > len(shown):
+        head += f"\n(showing the latest {len(shown)})"
+    send(chat_id, head + "\n".join(blocks))
+
+
+def show_now(chat_id: int) -> None:
+    send(chat_id, render_now())
 
 
 def show_entry(chat_id: int, entry_id: int) -> None:
@@ -930,6 +1494,16 @@ def route(chat_id: int, user_id: int, text: str) -> None:
     if low in {"all", "all events", "everything", "list all", "show all", "/all"}:
         show_all(chat_id)
         return
+    if low in {"history", "/history", "past", "past events", "completed",
+               "finished", "done items", "what did i do"}:
+        show_history(chat_id)
+        return
+    if low in {"now", "/now", "date", "/date", "time", "/time",
+               "what time is it", "what's the time", "whats the time",
+               "what is the date", "what's the date", "whats the date",
+               "today's date", "todays date", "what day is it", "/clock"}:
+        show_now(chat_id)
+        return
 
     data = call_llm(text)
     intent = data.get("intent")
@@ -949,6 +1523,14 @@ def route(chat_id: int, user_id: int, text: str) -> None:
             show_today(chat_id)
     elif intent == "list_all":
         show_all(chat_id)
+    elif intent == "history":
+        show_history(
+            chat_id,
+            validate_date(data.get("start_date")),
+            validate_date(data.get("end_date")),
+        )
+    elif intent == "now":
+        show_now(chat_id)
     elif intent == "overdue":
         show_overdue(chat_id)
     elif intent == "delete":
@@ -1080,6 +1662,96 @@ def selftest() -> None:
         assert pretty_time("00:30") == "12:30 AM"
         print("time formatting: ok")
 
+        # --- v2.02: recurring series ----------------------------------------
+        wk, err = build_series(future, "weekly", None, 8)
+        assert err is None and len(wk) == 8, (wk, err)
+        assert wk[0] == future, wk
+        assert wk[-1] == (today + timedelta(days=8 + 7 * 7)).isoformat(), wk
+        print("series weekly x8: ok")
+
+        wd, err = build_series(today.isoformat(), "weekdays", None, 10)
+        assert err is None and len(wd) == 10, (wd, err)
+        assert all(datetime.strptime(x, "%Y-%m-%d").weekday() < 5 for x in wd), wd
+        print("series weekdays x10 skips weekends: ok")
+
+        mo, err = build_series("2026-01-31", "monthly", None, 3)
+        assert mo == ["2026-01-31", "2026-02-28", "2026-03-31"], mo
+        print("series monthly clamps month-end: ok")
+
+        un, err = build_series(today.isoformat(), "daily",
+                              (today + timedelta(days=4)).isoformat(), None)
+        assert un and len(un) == 5, un
+        print("series daily until end date: ok")
+
+        big, err = build_series(today.isoformat(), "daily",
+                               (today + timedelta(days=400)).isoformat(), None)
+        assert big is None and err, "an over-long series must be refused"
+        print("series cap: ok")
+
+        # --- v2.02: the end date is compulsory ------------------------------
+        d, problem = plan_dates({"event_date": future, "freq": "weekly"})
+        assert d is None and "end date" in problem.lower(), problem
+        d, problem = plan_dates({"event_date": future, "freq": "weekly", "count": 3})
+        assert problem is None and len(d) == 3, (d, problem)
+        d, problem = plan_dates({
+            "event_date": future, "freq": "weekly",
+            "until": (today + timedelta(days=29)).isoformat(),
+        })
+        assert problem is None and len(d) == 4, (d, problem)
+        print("series without end date is refused, with one is accepted: ok")
+
+        pv = build_preview({"title": "Standup", "event_date": future,
+                            "event_time": "09:00", "freq": "weekly", "dates": wk})
+        assert "8 occurrences" in pv and "Ends" in pv, pv
+        assert "9:00 AM" in pv
+        pv1 = build_preview({"title": "One off", "event_date": future,
+                             "event_time": None, "dates": [future]})
+        assert "occurrences" not in pv1 and "Add this?" in pv1, pv1
+        print("confirmation states count and end date: ok")
+
+        # --- v2.02: end-date answers parsed locally, no model call ----------
+        assert parse_end_answer("8 times", "weekly", future) == ("count", 8)
+        assert parse_end_answer("30 nov", "weekly", future) == ("until", "2026-11-30")
+        assert parse_end_answer("until 2026-12-31", "daily", future) == ("until", "2026-12-31")
+        assert parse_end_answer("nov 30", "weekly", future) == ("until", "2026-11-30")
+        assert parse_end_answer("30/11/2026", "weekly", future) == ("until", "2026-11-30")
+        assert parse_end_answer("31 feb", "weekly", future) == (None, None)
+        assert parse_end_answer("banana", "weekly", future) == (None, None)
+        print("end-date answers: ok")
+
+        # --- v2.02: history -------------------------------------------------
+        done_id = insert_entry(today.isoformat(), "08:00", "Done thing (selftest)", "selftest")
+        assert update_entry(done_id, status="done")
+        hist = history_entries((today - timedelta(days=7)).isoformat(), today.isoformat())
+        titles = [h["title"] for h in hist]
+        assert any("Overdue thing" in t for t in titles), titles
+        assert any("Done thing" in t for t in titles), titles
+        assert not any("Submit GST" in t for t in titles), titles
+        assert hist[0]["event_date"] >= hist[-1]["event_date"], "newest first"
+        assert not entries_for_date(today.isoformat()), "the done item must not appear as open"
+
+        # A task finished BEFORE its date must still be findable: open lists hide
+        # it, so history is the only place it can live.
+        early = insert_entry(far_future, None, "Done early (selftest)", "selftest")
+        assert update_entry(early, status="done")
+        hist2 = history_entries((today - timedelta(days=7)).isoformat(), today.isoformat())
+        assert any("Done early" in h["title"] for h in hist2), [h["title"] for h in hist2]
+        print("history shows past + done, newest first: ok")
+
+        # --- v2.02: clock ---------------------------------------------------
+        clock = render_now()
+        assert today.isoformat() in clock and offset_str() in clock, clock
+        assert TZ_NAME in clock
+        if tz_is_suspect():
+            assert "NOT on Singapore time" in clock, clock
+        print("clock report: ok")
+
+        # --- v2.02: help fits a phone ---------------------------------------
+        for line in help_text().splitlines():
+            assert len(line) <= 36, f"help line too long ({len(line)}): {line}"
+        assert set(FREQ_LABEL) == {"daily", "weekdays", "weekly", "monthly"}
+        print("help text width + frequency set: ok")
+
         print("\n✅ all storage checks passed")
     finally:
         DB_PATH = original
@@ -1124,8 +1796,19 @@ def run_bot() -> None:
 
     print(f"allowed user: {ALLOWED_USER_ID}", flush=True)
     print(f"model: {MODEL}   db: {DB_PATH}", flush=True)
+    print(f"version: {VERSION}   clock: {offset_str()}", flush=True)
     print("polling... (Ctrl+C to stop)", flush=True)
-    notify_owner("📔 Planner is online.")
+
+    # A server on UTC silently shifts every date by 8 hours. Say so out loud.
+    if tz_is_suspect():
+        warn = (
+            f"⚠️ Planner clock is UTC{offset_str()}, expected UTC{TZ_EXPECTED_OFFSET}. "
+            "Dates will be wrong. Fix: sudo timedatectl set-timezone Asia/Singapore"
+        )
+        print(f"[warn] {warn}", flush=True)
+        notify_owner(warn)
+
+    notify_owner(f"📔 Planner v{VERSION} is online.")
 
     while True:
         try:
@@ -1162,6 +1845,13 @@ def main() -> None:
     if args[0] == "--init":
         init_db()
         print(f"ready: {DB_PATH}")
+    elif args[0] == "--version":
+        print(f"Telegram Planner v{VERSION}")
+        print(f"timezone: {TZ_NAME}  (machine reports UTC{offset_str()})")
+        if tz_is_suspect():
+            print(f"⚠️  WARNING: expected UTC{TZ_EXPECTED_OFFSET} — dates will be wrong.")
+        print(f"model: {MODEL}")
+        print(f"db: {DB_PATH}")
     elif args[0] == "--selftest":
         selftest()
     elif args[0] == "--ask":
